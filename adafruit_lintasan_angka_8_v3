@@ -1,0 +1,496 @@
+#define BUFFER_LENGTH 64
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_BNO055.h>
+#include <utility/imumaths.h>
+#include <CANSAME5x.h>
+#define MODE_SENT_FRAME_ID 0x401
+#define MODE_RECV_FRAME_ID 0x402
+#define SETP_SENT_FRAME_ID 0x403
+#define VEL_RECV_FRAME_ID 0x404
+#define TRACTION_SENT_FRAME_ID 0x405
+#define TRACTION_RECV_FRAME_ID 0x406
+#define STEER_SENT_FRAME_ID 0x407
+#define STEER_RECV_FRAME_ID 0x408
+#define MILLIS_RECV_FRAME_ID 0x409
+#define STATE_SENT_FRAME_ID 0x410
+#define PWM_COMMAND_RECV_FRAME_ID 0x411
+#define VREF_RECV_FRAME_ID 0x412
+#define ANGLE_SENT_FRAME_ID 0x413
+#define PWM_STEER_RECV_FRAME_ID 0x414
+#define GYR_X_RECV_FRAME_ID 0x415
+#define GYR_Y_RECV_FRAME_ID 0x416
+#define GYR_Z_RECV_FRAME_ID 0x417
+#define EUL_HEAD_RECV_FRAME_ID 0x418
+#define EUL_ROLL_RECV_FRAME_ID 0x419
+#define EUL_PITCH_RECV_FRAME_ID 0x420
+#define AX_RECV_FRAME_ID 0x421
+#define AY_RECV_FRAME_ID 0x422
+#define AZ_RECV_FRAME_ID 0x423
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
+CANSAME5x CAN;
+#include <stdbool.h>
+
+union Mgo1Char{ 
+    char c;
+    byte bytes[1];
+};
+
+union Mgo1Float{ 
+    float f;
+    byte bytes[4];
+};
+
+union Mgo1Int{ 
+    int16_t i;
+    uint8_t bytes[2];
+};
+
+union Mgo1Long{ 
+    unsigned long L;
+    byte bytes[4];
+};
+
+String getHexstring(byte data[], int length) {
+  String hexstring = "";
+  for(int i = 0; i < length; i++) {
+    if(data[i] < 0x10) {
+      hexstring += '0';
+    }
+
+    hexstring += String(data[i], HEX);
+  }
+  return hexstring;  
+}
+String HexString2ASCIIString(String hexstring) {
+  String temp = "", sub = "";
+  char buf[3];
+  for(int i = 0; i < hexstring.length(); i += 2){
+    sub = hexstring.substring(i, i+2);
+    sub.toCharArray(buf, 3);
+    char b = (char)strtol(buf, 0, 16);
+    if(b == '\0')
+      break;
+    temp += b;
+  }
+  return temp;
+}
+
+char mode = 'n';
+int steer = 1400, traction = 1500, pwm_steer_command = 1400, pwm_command = 1500;
+float setpoint = 0.0, angle = 0.0; 
+//angleBuff = 0.0;
+static int state;
+
+// PID PARAMETERS (adjust these!)
+float KP = 800.0;
+float KI = 512.0;
+float KD = 0.0;
+float SETPOINT = 0.0;  // Target velocity (m/s)
+volatile int NEUTRAL_PWM = 1522;
+float KPS = 16.0;
+float KIS = 0.8;
+float KDS = 0.0;
+float SETPOINTS = 0.0;  // Target velocity (m/s)
+volatile int NEUTRAL_PWMS = 1480;
+
+// Filtering
+float vEMA = 0.0, vEMAneg = 0.0, vEMAkir = 0.0, vEMAfil = 0.0;
+float EMA_ALPHA = 0.05;
+
+const int analog_pin1 = A0;
+const int analog_pin2 = A1;
+#define PIN_RELAY       12
+#define PWM_IN_TRACTION 9
+#define PWM_IN_STEER    10
+
+volatile int NEUTRAL_TRACT = 1522;
+volatile int NEUTRAL_STEER = 1503;
+
+volatile int pwm_steer_value = NEUTRAL_STEER;
+volatile unsigned long prev_steer_time = 0;
+
+volatile int pwm_tract_value = NEUTRAL_TRACT;
+volatile unsigned long prev_tract_time = 0;
+
+volatile unsigned long microtract = 0;
+volatile unsigned long microsteer = 0;
+
+// ---------------- Interrupts ----------------
+void change_traction() {
+  unsigned long t = micros();
+  microtract = t;
+  if (digitalRead(PWM_IN_TRACTION)) {
+    prev_tract_time = t;
+  } else {
+    unsigned long wt = t - prev_tract_time;
+    if (wt > 1000 && wt < 2000) pwm_tract_value = (int)wt;
+  }
+}
+
+void change_steer() {
+  unsigned long s = micros();
+  microsteer = s;
+  if (digitalRead(PWM_IN_STEER)) {
+    prev_steer_time = s;
+  } else {
+    unsigned long ws = s - prev_steer_time;
+    if (ws > 900 && ws < 1900) pwm_steer_value = (int)ws;
+  }
+}
+
+// ---------------- PCA9685 Helper ----------------
+static uint16_t pulseUsToTicks(int pulse_us) {
+  if (pulse_us < 750) pulse_us = 750;
+  if (pulse_us > 2250) pulse_us = 2250;
+  return (uint16_t)(((uint32_t)pulse_us * 4096UL + 10000UL) / 20000UL);
+}
+
+float accel = 0.0, vref = 0.0, vold = 0.0, pid_error = 0.0, pid_prev_error = 0.0, pid_integral = 0.0;
+float pid_proportional = 0.0, pid_integral_term = 0.0, pid_derivative = 0.0;
+float pid_output = 0.0;
+float aold = 0.0, pids_error = 0.0, pids_prev_error = 0.0, pids_integral = 0.0;
+float pids_proportional = 0.0, pids_integral_term = 0.0, pids_derivative = 0.0;
+float pids_output = 0.0;
+
+void setTraction(int traction_us) {
+  pwm.setPWM(0, 0, pulseUsToTicks(traction_us));
+}
+
+void setSteer(int steer_us) {
+  pwm.setPWM(1, 0, pulseUsToTicks(steer_us));
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(57600);
+  while (!Serial) delay(10);
+
+  Serial.println("M4 is alive");
+
+  Serial.println("CAN Tranceiver");
+
+  pinMode(PIN_CAN_STANDBY, OUTPUT);
+  digitalWrite(PIN_CAN_STANDBY, false); // turn off STANDBY
+  pinMode(PIN_CAN_BOOSTEN, OUTPUT);
+  digitalWrite(PIN_CAN_BOOSTEN, true); // turn on booster
+
+  // start the CAN bus at 1000 kbps
+  if (!CAN.begin(1000000)) {
+    Serial.println("Starting CAN failed!");
+    while (1) delay(10);
+  }
+  Serial.println("Starting CAN!");
+
+  Wire.begin();
+
+  pwm.begin();
+  pwm.setOscillatorFrequency(26100000);
+  pwm.setPWMFreq(50);
+
+  pinMode(PWM_IN_TRACTION, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PWM_IN_TRACTION), change_traction, CHANGE);
+
+  pinMode(PWM_IN_STEER, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PWM_IN_STEER), change_steer, CHANGE);
+
+}
+
+const int jumlahBuffer = 5;
+float angleArray[jumlahBuffer];
+float bufferAngle (float sudutBaru){
+  float jumlah = 0.0;
+  for (int i = 0; i < jumlahBuffer - 1; i++) {
+    angleArray[i] = angleArray[i + 1];
+    jumlah += angleArray[i];
+  }
+  angleArray[jumlahBuffer-1] = sudutBaru;
+  jumlah += sudutBaru;
+//  Serial.print("Angle Buffer: "); Serial.println(jumlah);
+  return jumlah;
+}
+
+// ---------------- Loop ----------------
+unsigned long previousMillis = 0;
+const long interval = 20;
+float eul_head = 0.0;
+
+void loop() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    // CAN package
+    int packetSize = CAN.parsePacket();
+    if (packetSize) {
+      // received a packet
+      Serial.print("Received ");
+      if (CAN.packetExtended()) {
+        Serial.print("extended ");
+      }
+      if (CAN.packetRtr()) {
+        Serial.print("RTR ");
+      }
+      Serial.print("packet with id 0x");
+      int packetId = CAN.packetId();
+      Serial.print(CAN.packetId(), HEX);
+      if (CAN.packetRtr()) {
+        Serial.print(" and requested length ");
+        Serial.println(CAN.packetDlc());
+      } else {
+        Serial.print(" and length ");
+        Serial.println(packetSize);
+        byte data[8];
+        // only print packet data for non-RTR packets
+        int i = 0;
+        while (CAN.available()) {
+          data[i] = CAN.read();
+          i++;
+        }
+        String result = "";
+        result = getHexstring(data, packetSize);
+        if(packetSize == 1 && packetId == MODE_SENT_FRAME_ID){
+          mode = (char)data[0];
+//          Serial.print("Mode: ");
+//          Serial.println(mode);
+        }
+          if(packetSize == 4 && packetId == SETP_SENT_FRAME_ID){
+          Mgo1Float setp;
+          setp.bytes[3] = data[3]; setp.bytes[2] = data[2]; setp.bytes[1] = data[1]; setp.bytes[0] = data[0];
+          setpoint = setp.f;
+//          Serial.print("Setpoint: ");
+//          Serial.println(setpoint);
+        }
+        if(packetSize == 4 && packetId == ANGLE_SENT_FRAME_ID){
+          Mgo1Float ang;
+          ang.bytes[3] = data[3]; ang.bytes[2] = data[2]; ang.bytes[1] = data[1]; ang.bytes[0] = data[0];
+          angle = ang.f;
+//          Serial.print("Angle: ");
+//          Serial.println(angle);
+        }
+        if(packetSize == 2 && packetId == STEER_SENT_FRAME_ID){
+          Mgo1Int sti2;
+          sti2.bytes[1] = data[1]; sti2.bytes[0] = data[0];
+          steer = sti2.i;
+//          Serial.print("Steer: ");
+//          Serial.println(steer);
+        }
+        if(packetSize == 2 && packetId == STATE_SENT_FRAME_ID){
+          Mgo1Int sta;
+          sta.bytes[1] = data[1]; sta.bytes[0] = data[0];
+          state = sta.i;
+//          Serial.print("State: ");
+//          Serial.println(state);
+        }
+      }
+      Serial.println();
+    }
+
+    int pin_value = LOW; //low for rc and high for otonom
+    if (mode == 'o'){
+      pin_value = HIGH;
+    } else if (mode == 'r'){
+      pin_value = LOW;
+    }
+    pinMode(PIN_RELAY, OUTPUT);
+    digitalWrite(PIN_RELAY, pin_value);
+//    delay(100);
+    
+    // --- Servo output ---
+    int pwmsteer = 1401;
+////    int steercommand = 1500;
+//    angleBuff = bufferAngle (angle);
+//    if (angle < 0.0){
+////      Serial.println("Neg deg");
+////      Serial.println(angleBuff);
+//      pwmsteer = round(-15.761 * angleBuff + 1567.1);
+//    } else if (angle > 0.0) {
+////      Serial.println("Pos deg");
+////      Serial.println(angleBuff);
+//      pwmsteer = round(-16.694 * angleBuff + 1455.5);
+//    } else {
+//      pwmsteer = 1480;
+//    }
+//    Serial.print(" PWM steer command: "); Serial.print(pwmsteer);
+    Serial.print(" Eul Head: "); Serial.print(eul_head);
+//    int steercommand = pwmsteer;
+//    setSteer(steercommand);
+//    pwm_steer_value = pwmsteer;
+//    pwm_tract_value = pwmtract;
+    noInterrupts();
+    int pwm_steer = pwm_steer_value;
+    int pwm_tract = pwm_tract_value;
+    interrupts();
+    int vel1 = analogRead(analog_pin1);
+    int vel2 = analogRead(analog_pin2);
+    int Vel1 = vel1 - 6;
+    int Vel2 = vel1 - 6;
+//    Serial.print(" | vByte1: "); Serial.print(vel1);
+//    Serial.print(" | vByte2: "); Serial.println(vel2);
+    float v1 = (Vel1 / 1023.0) * 4.0;
+    float v2 = (Vel2 / 1023.0) * 4.0;
+    float v = (v1 + v2) / 2.0;
+     vEMA = EMA_ALPHA * v + (1.0 - EMA_ALPHA) * vEMA;
+    if (vEMA > -0.012 && vEMA < 0.004) {
+      vEMAfil = 0.0;
+    } else {
+      vEMAfil = vEMA;
+    }
+    calculatePID(vEMA, 0.02, interval, currentMillis);
+    Serial.print(" PWM steer: "); Serial.print(pwm_steer);
+    Serial.print(" | PWM traction: "); Serial.println(pwm_tract);
+//    Serial.print(" | Kecepatan kiri: "); Serial.print(v1);
+//    Serial.print(" | Kecepatan kanan: "); Serial.print(v2);
+//    Serial.print(" | Kecepatan rerata: "); Serial.println(v);
+//    Serial.print(" | Kecepatan EMA: "); Serial.println(vEMA);
+    
+    uint8_t system, gyro, accel, mag = 0;
+    bno.getCalibration(&system, &gyro, &accel, &mag);
+    imu::Vector<3> euler = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
+    if (euler.x() >= 20){
+      eul_head = euler.x() - 360.0;
+    } else {
+      eul_head = euler.x();
+    }
+//    sensors_event_t event;
+//    bno.getEvent (&event);
+//    float eul_h = event.orientation.x;
+//    if (eul_h >= 20){
+//      eul_head = eul_h - 360;
+//    } else {
+//      eul_head = eul_h;
+//    }
+
+//    Serial.print(" | head value before: "); Serial.println(euler.x());
+//    Serial.print(" | head value after: "); Serial.println(eul_head);
+
+    calculatePIDsteer(eul_head, 0.02, interval, currentMillis);
+    
+    //Sending Millis
+    CAN.beginPacket(MILLIS_RECV_FRAME_ID);
+    Mgo1Long mills;
+    mills.L = currentMillis;  
+    CAN.write(mills.bytes[3]); CAN.write(mills.bytes[2]); CAN.write(mills.bytes[1]); CAN.write(mills.bytes[0]);
+    CAN.endPacket();
+    //Sending PWM Steer Command
+    CAN.beginPacket(PWM_STEER_RECV_FRAME_ID);
+    Mgo1Int pwms;
+    pwms.i = pwm_steer_command;
+    CAN.write(pwms.bytes[1]); CAN.write(pwms.bytes[0]);
+    CAN.endPacket(); 
+    //Sending Steer Interrupt
+    CAN.beginPacket(STEER_RECV_FRAME_ID);
+    Mgo1Int sti;
+    sti.i = pwm_steer;
+    CAN.write(sti.bytes[1]); CAN.write(sti.bytes[0]);
+    CAN.endPacket();
+    //Sending Vel
+    CAN.beginPacket(VEL_RECV_FRAME_ID);
+    Mgo1Float vel3;
+    vel3.f = vEMA;
+    CAN.write(vel3.bytes[3]); CAN.write(vel3.bytes[2]); CAN.write(vel3.bytes[1]); CAN.write(vel3.bytes[0]);
+    CAN.endPacket();
+    //Sending PWM Traction Command
+    CAN.beginPacket(PWM_COMMAND_RECV_FRAME_ID);
+    Mgo1Int pw;
+    pw.i = pwm_command;
+    CAN.write(pw.bytes[1]); CAN.write(pw.bytes[0]);
+    CAN.endPacket(); 
+    //Sending Traction Interrupt
+    CAN.beginPacket(TRACTION_RECV_FRAME_ID);
+    Mgo1Int tri;
+    tri.i = pwm_tract;
+    CAN.write(tri.bytes[1]); CAN.write(tri.bytes[0]);
+    CAN.endPacket();
+    //Sending Vref
+    CAN.beginPacket(VREF_RECV_FRAME_ID);
+    Mgo1Float vr;
+    vr.f = vref;
+    CAN.write(vr.bytes[3]); CAN.write(vr.bytes[2]); CAN.write(vr.bytes[1]); CAN.write(vr.bytes[0]);
+    CAN.endPacket();
+    //Sending eul_head
+    CAN.beginPacket(EUL_HEAD_RECV_FRAME_ID);
+    Mgo1Float eula;
+    eula.f = eul_head;
+    CAN.write(eula.bytes[3]); CAN.write(eula.bytes[2]); CAN.write(eula.bytes[1]); CAN.write(eula.bytes[0]);
+    CAN.endPacket();
+  
+    previousMillis = millis();
+  }
+}
+
+void calculatePID(float current_velocity, float dt, int interval, unsigned long currentMillis) {
+    SETPOINT = setpoint;
+//  int x = 48;
+//  accel = x * SETPOINT / 60000.0; //accelerator variable, change the x for adjustment
+//  vref = vold + (accel * interval);
+//  if (vref > SETPOINT){
+    vref = SETPOINT;
+//  }
+  
+  pid_error = vref - current_velocity;
+  Serial.print(" | PIDsp error: ");
+  Serial.println(pid_error);
+  pid_proportional = KP * pid_error;
+  pid_integral += pid_error * dt;
+  if (pid_integral > 600) pid_integral = 600.00;
+  if (pid_integral < -600) pid_integral = -600.00;
+  pid_integral_term = KI * pid_integral;
+  pid_derivative = KD * (pid_error - pid_prev_error) / dt;
+  pid_output = pid_proportional + pid_integral_term + pid_derivative;
+
+  int pid_command = NEUTRAL_PWM + (int)pid_output;
+  pwm_command = pid_command;
+  
+  pwm_command = constrain(pwm_command, 1000, 2000);
+  Serial.print(" PID pwm: ");
+  Serial.println(pwm_command);
+
+//  setTraction(1545);
+  setTraction(pwm_command);
+  pid_prev_error = pid_error;
+  vold = vref;
+}
+
+void calculatePIDsteer(float current_yaw, float dts, int intervals, unsigned long currentMillis) {
+
+  float angleBuff = bufferAngle (angle);
+//  float angleBuff = 0;
+  pids_error = angleBuff - current_yaw;
+////  Serial.print("Angle SP: ");
+////  Serial.println(angle);
+  Serial.print("Angle Buff: ");
+  Serial.print(angleBuff);
+  Serial.print(" | Yaw: ");
+  Serial.print(current_yaw);
+  Serial.print(" | PIDst error: ");
+  Serial.println(pids_error);
+  pids_proportional = KPS * pids_error;
+  pids_integral += pids_error * dts;
+  if (pids_integral > 600) pids_integral = 600.00;
+  if (pids_integral < -600) pids_integral = -600.00;
+  pids_integral_term = KIS * pids_integral;
+  pids_derivative = KDS * (pids_error - pids_prev_error) / dts;
+  pids_output = pids_proportional + pids_integral_term + pids_derivative;
+
+  if (angleBuff < 0.0){
+     NEUTRAL_PWMS = 1567;
+  } else if (angleBuff > 0.0){
+     NEUTRAL_PWMS = 1456;
+  } else if (aold > 0.0 && angleBuff < 0.0) {
+     NEUTRAL_PWMS = 1529;
+  } else {
+    NEUTRAL_PWMS = 1480;
+  }
+  int pids_command = NEUTRAL_PWMS - (int)pids_output;
+  pwm_steer_command = pids_command;
+  
+  pwm_steer_command = constrain(pwm_steer_command, 900, 1900);
+  Serial.print(" PID pwm steer: ");
+  Serial.println(pwm_steer_command);
+
+//  setSteer(1540);
+  setSteer(pwm_steer_command);
+  pids_prev_error = pids_error;
+  aold = angle;
+}
